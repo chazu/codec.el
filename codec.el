@@ -37,11 +37,12 @@
 ;; machine.
 ;;
 ;; Each voice prompt gets `codec-voice-preamble', which asks the agent
-;; to end its reply with a short summary between `codec-spoken-open'
-;; and `codec-spoken-close'.  Typed prompts are left alone.  When the
-;; agent finishes a reply to a voice prompt, codec speaks that summary
-;; with `codec-tts-backend' (macOS say, or Piper) and mutes the listener
-;; while it speaks.
+;; to begin its reply with a short summary between `codec-spoken-open'
+;; and `codec-spoken-close'.  Typed prompts are left alone.  As soon as
+;; the summary of a reply to a voice prompt has streamed in, codec
+;; speaks it with `codec-tts-backend' (macOS say, or Piper) and mutes
+;; the listener while it speaks.  Set `codec-spoken-position' to bottom
+;; to ask for the summary at the end and hear it when the turn ends.
 ;;
 ;; Suggested binding, for a foot pedal that sends S-<f12>:
 ;;
@@ -135,17 +136,40 @@ Run the listener with --help for the full list."
   "The tag that closes the spoken summary in a reply to a voice prompt."
   :type 'string)
 
-(defcustom codec-voice-preamble
-  (concat "[voice] The user is speaking to you hands-free and will hear "
-          "only a short spoken summary.  Answer normally in full.  Then "
-          "end your reply with %oone or two plain, speakable sentences: "
-          "the result and the one thing the user should do next%c.  No "
-          "code, paths or markdown inside %o.  The transcript below may "
-          "have speech-recognition errors.")
+(defcustom codec-spoken-position 'top
+  "Where the agent puts the spoken summary in its reply.
+top asks for the summary first, and codec speaks it as soon as its
+close tag arrives, while the agent writes the rest.  bottom asks for
+it last, and codec speaks it when the turn completes."
+  :type '(choice (const :tag "At the start of the reply" top)
+                 (const :tag "At the end of the reply" bottom)))
+
+(defconst codec-voice-preambles
+  `((top
+     . ,(concat "[voice] The user is speaking to you hands-free and will "
+                "hear only a short spoken summary.  Begin your reply with "
+                "%oone or two plain, speakable sentences: the result and "
+                "the one thing the user should do next%c.  Then answer "
+                "normally in full.  No code, paths or markdown inside %o.  "
+                "The transcript below may have speech-recognition errors."))
+    (bottom
+     . ,(concat "[voice] The user is speaking to you hands-free and will "
+                "hear only a short spoken summary.  Answer normally in "
+                "full.  Then end your reply with %oone or two plain, "
+                "speakable sentences: the result and the one thing the "
+                "user should do next%c.  No code, paths or markdown inside "
+                "%o.  The transcript below may have speech-recognition "
+                "errors.")))
+  "The built-in voice preamble for each `codec-spoken-position'.")
+
+(defcustom codec-voice-preamble nil
   "Instructions added to each voice prompt, and to no typed prompt.
-%o stands for `codec-spoken-open' and %c for `codec-spoken-close';
-write %% for a literal %.  An empty string adds nothing."
-  :type 'string)
+nil means the text in `codec-voice-preambles' for
+`codec-spoken-position'.  In a string, %o stands for
+`codec-spoken-open' and %c for `codec-spoken-close'; write %% for a
+literal %.  An empty string adds nothing."
+  :type '(choice (const :tag "Built-in text for `codec-spoken-position'" nil)
+                 string))
 
 (defcustom codec-preamble-position 'prepend
   "Where `codec-voice-preamble' goes relative to the transcript."
@@ -427,7 +451,9 @@ BUFFER nil means no target."
 (defun codec-wrap-transcript (transcript)
   "Return TRANSCRIPT with `codec-voice-preamble' added."
   (let ((preamble (string-trim
-                   (format-spec codec-voice-preamble
+                   (format-spec (or codec-voice-preamble
+                                    (alist-get codec-spoken-position
+                                               codec-voice-preambles))
                                 `((?o . ,codec-spoken-open)
                                   (?c . ,codec-spoken-close))))))
     (cond ((string-empty-p preamble) transcript)
@@ -517,13 +543,18 @@ nil means say nothing."
 (defvar codec--voice-turn nil
   "The reply to the last voice prompt, while the agent writes it.
 A plist with :buffer, the agent-shell buffer; :chunks, the text
-chunks so far, newest first; and :start, a marker at the start of the
-reply, or nil before the first chunk.")
+chunks so far, newest first; :start, a marker at the start of the
+reply, or nil before the first chunk; :position, the value of
+`codec-spoken-position' when the prompt was sent; and :spoken,
+non-nil once codec started to speak the summary before the end of
+the turn.")
 
 (defun codec--begin-voice-turn (buffer)
   "Start to collect the reply in BUFFER to a voice prompt."
   (codec--drop-voice-turn)
-  (setq codec--voice-turn (list :buffer buffer :chunks nil :start nil)))
+  (setq codec--voice-turn (list :buffer buffer :chunks nil :start nil
+                                :position codec-spoken-position
+                                :spoken nil)))
 
 (defun codec--drop-voice-turn ()
   "Forget the voice turn in progress, if any."
@@ -540,7 +571,29 @@ CHUNK is nil for a block that is not text."
         (setq turn (plist-put turn :start (with-current-buffer buffer
                                             (copy-marker (point-max))))))
       (setq codec--voice-turn
-            (plist-put turn :chunks (cons chunk (plist-get turn :chunks)))))))
+            (plist-put turn :chunks (cons chunk (plist-get turn :chunks))))
+      (codec--maybe-speak-early chunk))))
+
+(defun codec--maybe-speak-early (chunk)
+  "Speak the first summary of the voice turn if CHUNK completed it.
+Only when the summary goes at the top; see `codec-spoken-position'.
+A summary with nothing speakable in it is left for the end of the
+turn, which then says `codec-no-summary-text'."
+  (let ((turn codec--voice-turn)
+        (close codec-spoken-close))
+    (when (and codec-mode
+               (eq (plist-get turn :position) 'top)
+               (not (plist-get turn :spoken))
+               (not (string-empty-p close))
+               ;; The close tag can only end in a chunk with its last char.
+               (string-search (substring close -1) chunk))
+      (when-let* ((spoken (codec-extract-spoken
+                           (apply #'concat (reverse (plist-get turn :chunks)))
+                           t))
+                  (speech (codec--speakable spoken))
+                  ((not (string-empty-p speech))))
+        (setq codec--voice-turn (plist-put turn :spoken t))
+        (codec-speak speech)))))
 
 (defun codec--turn-complete (buffer data)
   "Speak the reply in BUFFER if it was a voice turn, then send the queue.
@@ -552,21 +605,30 @@ DATA is the data of agent-shell's turn-complete event."
 (defun codec--finish-voice-turn (buffer data)
   "Speak the summary of the voice turn in BUFFER and mark it in BUFFER.
 DATA is the data of the turn-complete event.  Speak nothing if the
-turn was cancelled."
+turn was cancelled, or if codec already speaks the summary from the
+top of the reply."
   (let ((turn codec--voice-turn))
     (when (and turn (eq buffer (plist-get turn :buffer)))
-      (let* ((text (apply #'concat (reverse (plist-get turn :chunks))))
-             (spoken (codec-extract-spoken text))
+      (let* ((first (eq (plist-get turn :position) 'top))
+             (text (apply #'concat (reverse (plist-get turn :chunks))))
+             (spoken (codec-extract-spoken text first))
              (speech (and spoken (codec--speakable spoken)))
              (start (plist-get turn :start)))
         (when (and spoken start (buffer-live-p buffer))
-          (codec--mark-spoken buffer start))
+          (codec--mark-spoken buffer start first))
         (codec--drop-voice-turn)
-        (unless (equal (alist-get :stop-reason data) "cancelled")
+        (unless (or (plist-get turn :spoken)
+                    (equal (alist-get :stop-reason data) "cancelled"))
           (cond ((and speech (not (string-empty-p speech)))
                  (codec-speak speech))
                 (codec-no-summary-text
                  (codec-speak codec-no-summary-text))))))))
+
+(defun codec--first-index (needle haystack &optional start)
+  "Return where the first NEEDLE in HAYSTACK at or after START starts.
+Return nil if there is none."
+  (unless (string-empty-p needle)
+    (string-search needle haystack (or start 0))))
 
 (defun codec--last-index (needle haystack &optional end)
   "Return where the last NEEDLE in HAYSTACK starts, or nil.
@@ -579,12 +641,18 @@ With END, the match must end at or before END."
               pos (1+ pos)))
       last)))
 
-(defun codec-extract-spoken (text)
+(defun codec-extract-spoken (text &optional first)
   "Return the text of the last spoken summary in TEXT, or nil.
-The summary is between `codec-spoken-open' and `codec-spoken-close'."
-  (when-let* ((close (codec--last-index codec-spoken-close text))
-              (open (codec--last-index codec-spoken-open text close)))
-    (substring text (+ open (length codec-spoken-open)) close)))
+With FIRST non-nil, return the first complete one instead.  The
+summary is between `codec-spoken-open' and `codec-spoken-close'."
+  (if first
+      (when-let* ((open (codec--first-index codec-spoken-open text))
+                  (from (+ open (length codec-spoken-open)))
+                  (close (codec--first-index codec-spoken-close text from)))
+        (substring text from close))
+    (when-let* ((close (codec--last-index codec-spoken-close text))
+                (open (codec--last-index codec-spoken-open text close)))
+      (substring text (+ open (length codec-spoken-open)) close))))
 
 (defun codec--speakable (text)
   "Return TEXT without markdown or code, at most `codec-spoken-max-chars' long."
@@ -620,24 +688,38 @@ MAX nil means no limit."
               (substring cut 0 (match-beginning 0)))
              (t cut))))))
 
-(defun codec--mark-spoken (buffer start)
+(defun codec--mark-spoken (buffer start &optional first)
   "Give the last spoken summary in BUFFER after START an overlay.
-The overlay has `codec-spoken-face', and is invisible if
-`codec-hide-spoken' is non-nil.  Return the overlay, or nil."
+With FIRST non-nil, mark the first one instead.  The overlay has
+`codec-spoken-face', and is invisible if `codec-hide-spoken' is
+non-nil.  Return the overlay, or nil."
   (with-current-buffer buffer
     (save-excursion
+      (when-let* ((bounds (codec--spoken-bounds start first)))
+        (let ((overlay (make-overlay (car bounds) (cdr bounds))))
+          (overlay-put overlay 'codec-spoken t)
+          (overlay-put overlay 'face 'codec-spoken-face)
+          (overlay-put overlay 'evaporate t)
+          (when codec-hide-spoken
+            (overlay-put overlay 'invisible t))
+          overlay)))))
+
+(defun codec--spoken-bounds (start first)
+  "Return (OPEN . END) of the last spoken summary after START, or nil.
+With FIRST non-nil, return the first complete one instead.  Move point."
+  (let ((case-fold-search nil))
+    (if first
+        (progn
+          (goto-char start)
+          (when-let* ((open (and (search-forward codec-spoken-open nil t)
+                                 (match-beginning 0)))
+                      (end (search-forward codec-spoken-close nil t)))
+            (cons open end)))
       (goto-char (point-max))
-      (let ((case-fold-search nil))
-        (when-let* ((end (and (search-backward codec-spoken-close start t)
-                              (match-end 0)))
-                    (open (search-backward codec-spoken-open start t)))
-          (let ((overlay (make-overlay open end)))
-            (overlay-put overlay 'codec-spoken t)
-            (overlay-put overlay 'face 'codec-spoken-face)
-            (overlay-put overlay 'evaporate t)
-            (when codec-hide-spoken
-              (overlay-put overlay 'invisible t))
-            overlay))))))
+      (when-let* ((end (and (search-backward codec-spoken-close start t)
+                            (match-end 0)))
+                  (open (search-backward codec-spoken-open start t)))
+        (cons open end)))))
 
 ;;;; Speech
 

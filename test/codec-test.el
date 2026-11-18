@@ -74,6 +74,8 @@
          (codec-spoken-max-chars 400)
          (codec-no-summary-text "Reply ready.")
          (codec-hide-spoken nil)
+         (codec-spoken-position 'top)
+         (codec-voice-preamble nil)
          (process-environment process-environment)
          (original-send (symbol-function 'codec--send))
          (counter 0)
@@ -456,9 +458,10 @@ STOP-REASON defaults to \"end_turn\"."
   (let ((codec-spoken-max-chars 10))
     (should (<= (length (codec--speakable "word word word word")) 10))))
 
-(ert-deftest codec-test-voice-reply-is-spoken ()
+(ert-deftest codec-test-bottom-reply-is-spoken-at-end ()
   (codec-test--with-env
-    (let ((shell (codec-test--shell "*agent-shell a*")))
+    (let ((shell (codec-test--shell "*agent-shell a*"))
+          (codec-spoken-position 'bottom))
       (codec-test--start shell)
       ;; The tags are split across chunks, and the last block wins.
       (codec-test--voice-reply
@@ -494,7 +497,8 @@ STOP-REASON defaults to \"end_turn\"."
 
 (ert-deftest codec-test-cancelled-turn-is-not-spoken ()
   (codec-test--with-env
-    (let ((shell (codec-test--shell "*agent-shell a*")))
+    (let ((shell (codec-test--shell "*agent-shell a*"))
+          (codec-spoken-position 'bottom))
       (codec-test--start shell)
       (codec-test--voice-reply shell '("<spoken>Half.</spoken>") "cancelled")
       (should-not (codec--speaking-p)))))

@@ -25,8 +25,15 @@ speaker ◄─ say or Piper ◄─ <spoken> summary ◄─────┘
 2. The listener reads the microphone. Silero VAD finds speech. After
    900 ms of silence (`codec-silence-ms`) the utterance ends.
 3. faster-whisper transcribes the utterance. The listener drops empty
-   transcripts and the phrases Whisper invents on silence ("you",
-   "Thank you.").
+   transcripts, the phrases Whisper invents on silence ("you",
+   "Thank you."), and transcripts made only of filler words ("Um...",
+   "Uh, hmm."). It sends a transcript with any other word, such as
+   "Um, run the tests", as is. Case and punctuation do not matter.
+   The filler words are um, uh, umm, uhh, hmm, hm, mm, mhm, erm, er,
+   ah, eh and oh. Yes/no words such as "yeah" are not filler words,
+   because they can be real answers. Add more with `codec-drop-phrases`
+   and `codec-filler-words`. To disable the built-in lists, add
+   `--no-default-drop-phrases` to `codec-listener-extra-args`.
 4. codec adds `codec-voice-preamble` to the transcript and submits it
    in the target agent-shell buffer. If the agent is in a turn, codec
    queues the utterance and sends it when the turn completes.
@@ -162,6 +169,7 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
   (codec-model "base.en")               ; faster, less accurate
   (codec-silence-ms 1200)               ; wait longer before sending
   (codec-drop-phrases '("okay"))        ; more noise to drop
+  (codec-filler-words '("like"))        ; "Like, like." alone is dropped
   (codec-device 'cpu)                   ; skip the Apple GPU
   (codec-cancel-phrases '("scratch that" "never mind"))
   (codec-say-voice "Samantha")          ; say -v '?' lists the voices
@@ -177,6 +185,7 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 | `codec-compute-type`        | `auto`          | `auto`, or a CTranslate2 compute type such as `int8`. |
 | `codec-silence-ms`          | `900`           | Silence that ends an utterance. |
 | `codec-drop-phrases`        | `nil`           | Transcripts to drop, besides the built-in list. |
+| `codec-filler-words`        | `nil`           | Filler words, besides the built-in list. A transcript of only filler words is dropped. |
 | `codec-listener-extra-args` | `nil`           | More listener options (`--help` lists them). |
 | `codec-voice-preamble`      | see below       | Instructions added to each voice prompt. `%o`/`%c` are the tags. |
 | `codec-preamble-position`   | `prepend`       | `prepend` or `append` the preamble. |

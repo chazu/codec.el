@@ -55,6 +55,13 @@ DEFAULT_DROP_PHRASES = (
     "subtitles by the amara org community",
 )
 
+# Hesitation sounds.  A transcript made only of these words, such as
+# "Um..." or "Uh, hmm.", is dropped; one with any other word is kept.
+# No yes/no words here: "yeah" or "no" alone can be a real answer.
+DEFAULT_FILLER_WORDS = (
+    "um", "uh", "umm", "uhh", "hmm", "hm", "mm", "mhm", "erm", "er", "ah", "eh", "oh",
+)
+
 # Non-speech annotations such as "[BLANK_AUDIO]", "(music)" or "*cough*".
 _ANNOTATION = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|♪")
 _NON_WORD = re.compile(r"[^\w']+")
@@ -99,18 +106,25 @@ def normalize(text: str) -> str:
 
 
 def clean_utterance(
-    text: str, drop_phrases: Iterable[str] = DEFAULT_DROP_PHRASES, min_chars: int = 2
+    text: str,
+    drop_phrases: Iterable[str] = DEFAULT_DROP_PHRASES,
+    min_chars: int = 2,
+    filler_words: Iterable[str] = DEFAULT_FILLER_WORDS,
 ) -> Optional[str]:
     """Return TEXT tidied, or None if it is empty, too short or noise.
 
     Noise is a transcript that is only annotations such as "[BLANK_AUDIO]",
-    or one that matches a phrase in DROP_PHRASES after `normalize'.
+    one that matches a phrase in DROP_PHRASES after `normalize', or one
+    whose words are all in FILLER_WORDS.
     """
     cleaned = " ".join(text.split())
     words = normalize(_ANNOTATION.sub(" ", cleaned))
     if len(words.replace(" ", "")) < min_chars:
         return None
     if words in {normalize(p) for p in drop_phrases}:
+        return None
+    fillers = {w for f in filler_words for w in normalize(f).split()}
+    if fillers.issuperset(words.split()):
         return None
     return cleaned
 
@@ -353,6 +367,7 @@ class Listener:
         emit: Callable[..., None],
         drop_phrases: Iterable[str] = DEFAULT_DROP_PHRASES,
         min_chars: int = 2,
+        filler_words: Iterable[str] = DEFAULT_FILLER_WORDS,
         capturing: bool = True,
         muted: bool = False,
     ):
@@ -362,6 +377,7 @@ class Listener:
         self.emit = emit
         self.drop_phrases = tuple(drop_phrases)
         self.min_chars = min_chars
+        self.filler_words = tuple(filler_words)
         self.capturing = capturing
         self.muted = muted
         self.inbox: queue.Queue = queue.Queue()
@@ -445,7 +461,9 @@ class Listener:
     def transcribe(self, audio: np.ndarray) -> Optional[str]:
         """Transcribe AUDIO and emit it unless it is noise or we are muted."""
         try:
-            text = clean_utterance(self.transcriber(audio), self.drop_phrases, self.min_chars)
+            text = clean_utterance(
+                self.transcriber(audio), self.drop_phrases, self.min_chars, self.filler_words
+            )
         except Exception as e:  # keep listening after a bad utterance
             log.exception("transcription failed")
             self.emit("error", message=f"transcription failed: {e}")
@@ -493,7 +511,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-default-drop-phrases",
         action="store_true",
-        help="drop only the --drop-phrase phrases",
+        help="drop only the --drop-phrase phrases and --filler-word words",
+    )
+    p.add_argument(
+        "--filler-word",
+        action="append",
+        default=[],
+        help="word such as 'um'; transcripts of only filler words are dropped (repeatable)",
     )
     p.add_argument("--no-autostart", action="store_true", help="wait for 'start' to capture")
     p.add_argument("--muted", action="store_true", help="start muted")
@@ -540,8 +564,10 @@ def main(
     sys.stdout = sys.stderr
 
     drop = tuple(args.drop_phrase)
+    fillers = tuple(args.filler_word)
     if not args.no_default_drop_phrases:
         drop = DEFAULT_DROP_PHRASES + drop
+        fillers = DEFAULT_FILLER_WORDS + fillers
     config = SegmenterConfig(
         threshold=args.threshold,
         neg_threshold=max(0.0, args.threshold - 0.15),
@@ -556,6 +582,7 @@ def main(
         emit=emit,
         drop_phrases=drop,
         min_chars=args.min_chars,
+        filler_words=fillers,
         capturing=not args.no_autostart,
         muted=args.muted,
     )

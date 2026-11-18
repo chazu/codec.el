@@ -91,6 +91,30 @@ def test_custom_drop_phrases():
     assert cl.clean_utterance("you", drop_phrases=["okay"]) == "you"
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["Um...", "um", "UM.", "Uh, um", "uh... um... hmm?", "Hmm.", "Mhm!", "Oh.", "Erm, er, ah, eh"],
+)
+def test_filler_only_is_dropped(text):
+    assert cl.clean_utterance(text) is None
+
+
+@pytest.mark.parametrize(
+    "text", ["Um, run the tests.", "Uh... yes", "But, yeah.", "Yeah.", "No.", "Oh, commit it."]
+)
+def test_filler_with_other_words_is_kept(text):
+    assert cl.clean_utterance(text) == text
+
+
+def test_custom_filler_words():
+    assert cl.clean_utterance("Like, like.", filler_words=["like"]) is None
+    assert cl.clean_utterance("Um.", filler_words=["like"]) == "Um."
+
+
+def test_no_filler_words_keeps_filler():
+    assert cl.clean_utterance("Um...", drop_phrases=[], filler_words=[]) == "Um..."
+
+
 def test_min_chars():
     assert cl.clean_utterance("ok", drop_phrases=[], min_chars=3) is None
     assert cl.clean_utterance("yes", drop_phrases=[], min_chars=3) == "yes"
@@ -233,6 +257,13 @@ def test_noise_transcript_is_not_emitted():
     assert events.events == []
 
 
+def test_filler_transcript_is_not_emitted():
+    listener, events = make_listener(text="Um...")
+    speak(listener)
+    assert listener.transcribe_next(timeout=1) is None
+    assert events.events == []
+
+
 def test_transcriber_failure_reports_error_and_carries_on():
     def boom(audio):
         raise RuntimeError("bad audio")
@@ -322,6 +353,9 @@ def test_parser_defaults():
     assert args.compute_type == "auto"
     args = cl.build_parser().parse_args(["--drop-phrase", "okay", "--drop-phrase", "bye"])
     assert args.drop_phrase == ["okay", "bye"]
+    assert args.filler_word == []
+    args = cl.build_parser().parse_args(["--filler-word", "like", "--filler-word", "so"])
+    assert args.filler_word == ["like", "so"]
 
 
 # --- Device ----------------------------------------------------------------
@@ -401,6 +435,34 @@ def run_download_only(monkeypatch, loader, system="Darwin", machine="arm64", arg
     monkeypatch.setattr(sys, "stdout", out)
     code = cl.main(["--download-only", *args], loader=loader, make_vad=lambda: None)
     return code, [json.loads(line) for line in out.getvalue().splitlines()]
+
+
+def listener_filters(monkeypatch, *args):
+    """Return the drop phrases and filler words `main' gives the Listener."""
+    seen = {}
+    real = cl.Listener
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(cl, "Listener", spy)
+    run_download_only(monkeypatch, FakeLoader(), args=args)
+    return seen["drop_phrases"], seen["filler_words"]
+
+
+def test_main_uses_default_filler_words(monkeypatch):
+    drop, fillers = listener_filters(monkeypatch, "--filler-word", "like")
+    assert drop == cl.DEFAULT_DROP_PHRASES
+    assert fillers == cl.DEFAULT_FILLER_WORDS + ("like",)
+
+
+def test_no_default_drop_phrases_disables_filler_words(monkeypatch):
+    drop, fillers = listener_filters(
+        monkeypatch, "--no-default-drop-phrases", "--drop-phrase", "okay", "--filler-word", "um"
+    )
+    assert drop == ("okay",)
+    assert fillers == ("um",)
 
 
 def test_ready_event_names_device_and_compute_type(monkeypatch):

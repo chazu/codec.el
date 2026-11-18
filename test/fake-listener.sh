@@ -7,7 +7,7 @@ if [ -n "$CODEC_FAKE_FAIL" ]; then
   printf '{"type":"error","message":"%s"}\n' "$CODEC_FAKE_FAIL"
   exit 3
 fi
-echo '{"type":"ready"}'
+echo '{"type":"ready","device":"mps","compute_type":"int8_float16","extra":1}'
 echo '{"type":"listening"}'
 while IFS= read -r command; do
   case "$command" in

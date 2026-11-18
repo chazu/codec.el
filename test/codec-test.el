@@ -213,6 +213,50 @@
       (should (equal (codec-test--sent-texts)
                      (list (codec-wrap-transcript "Cancel the deploy.")))))))
 
+(ert-deftest codec-test-trailing-cancel-discards-utterance ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (codec--handle-utterance "run the tests on staging, scratch that")
+      (should (equal (car codec-test--messages) "codec: discarded"))
+      (codec--handle-utterance "Deploy it. Scratch that!")
+      (codec--handle-utterance "Open the log... NEVER MIND.")
+      (should (equal (car codec-test--messages) "codec: discarded"))
+      (should-not codec--queue)
+      (should-not codec-test--sent))))
+
+(ert-deftest codec-test-trailing-cancel-keeps-queue ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (setq codec-test--busy t)
+      (codec--handle-utterance "first")
+      (codec--handle-utterance "second")
+      (codec--handle-utterance "third, scratch that.")
+      (should (equal codec--queue '("first" "second")))
+      (should (equal (car codec-test--messages)
+                     "codec: discarded (2 still queued)"))
+      ;; A whole-utterance cancel still empties the queue.
+      (codec--handle-utterance "Scratch that.")
+      (should-not codec--queue)
+      (should (equal (car codec-test--messages) "codec: discarded")))))
+
+(ert-deftest codec-test-cancel-phrase-elsewhere-is-text ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (dolist (text '("what does scratch that do"
+                      "how do I cancel?"
+                      "please don't cancel"
+                      "rescratch that"))
+        (codec--handle-utterance text))
+      (should (equal (codec-test--sent-texts)
+                     (mapcar #'codec-wrap-transcript
+                             '("what does scratch that do"
+                               "how do I cancel?"
+                               "please don't cancel"
+                               "rescratch that")))))))
+
 (ert-deftest codec-test-muted-drops-utterances ()
   (codec-test--with-env
     (let ((shell (codec-test--shell "*agent-shell a*")))

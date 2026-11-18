@@ -163,7 +163,15 @@ write %% for a literal %.  An empty string adds nothing."
 (defcustom codec-cancel-phrases '("scratch that" "cancel")
   "Utterances that send nothing and discard queued utterances.
 An utterance matches when it equals a phrase, ignoring case and
-punctuation."
+punctuation.  See also `codec-cancel-trailing-phrases'."
+  :type '(repeat string))
+
+(defcustom codec-cancel-trailing-phrases '("scratch that" "never mind")
+  "Phrases that discard the utterance they end.
+An utterance that ends with one of these phrases, as whole words and
+ignoring case and punctuation, is not sent.  Queued utterances stay
+queued.  Keep words such as \"cancel\" out of this list, because
+\"how do I cancel\" is a real prompt."
   :type '(repeat string))
 
 (defcustom codec-mode-line-states
@@ -219,7 +227,9 @@ is sent to the target agent-shell buffer as a prompt, with
 current, or else the one selected most recently; change it with
 `codec-set-target'.  While the agent is in a turn, utterances wait
 and go out when the turn completes.  Say a phrase in
-`codec-cancel-phrases' to discard them.
+`codec-cancel-phrases' to discard them.  End an utterance with a
+phrase in `codec-cancel-trailing-phrases' to discard only that
+utterance.
 
 When the agent replies to a voice prompt, codec speaks the summary
 in the reply with `codec-tts-backend', and mutes the listener while
@@ -455,6 +465,16 @@ BUFFER nil means no target."
   (member (codec--normalize text)
           (mapcar #'codec--normalize codec-cancel-phrases)))
 
+(defun codec--trailing-cancel-p (text)
+  "Return non-nil if TEXT ends with one of `codec-cancel-trailing-phrases'.
+The phrase must start at a word boundary."
+  (let ((text (concat " " (codec--normalize text))))
+    (seq-some (lambda (phrase)
+                (let ((phrase (codec--normalize phrase)))
+                  (and (not (string-empty-p phrase))
+                       (string-suffix-p (concat " " phrase) text))))
+              codec-cancel-trailing-phrases)))
+
 (defun codec--busy-p (buffer)
   "Return non-nil if the agent in BUFFER is in a turn."
   (with-current-buffer buffer
@@ -471,6 +491,11 @@ BUFFER nil means no target."
      ((codec--cancel-phrase-p text)
       (setq codec--queue nil)
       (message "codec: discarded"))
+     ((codec--trailing-cancel-p text)
+      (codec--log "discarded: %s" text)
+      (if codec--queue
+          (message "codec: discarded (%d still queued)" (length codec--queue))
+        (message "codec: discarded")))
      ((not (codec--target-live-p))
       (codec--log "dropped, no target: %s" text)
       (codec--check-target))

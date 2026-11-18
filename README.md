@@ -148,6 +148,15 @@ you run `codec-set-target`.
 a whole utterance. codec sends nothing, discards queued utterances, and
 shows `codec: discarded`.
 
+End an utterance with "scratch that" or "never mind"
+(`codec-cancel-trailing-phrases`) to discard only that utterance, as in
+"run the tests on staging, scratch that". Case and punctuation do not
+matter. Queued utterances stay queued, and the message gives their
+number, such as `codec: discarded (2 still queued)`. "cancel" is not in
+this list, so "how do I cancel" goes to the agent. A phrase in the
+middle of an utterance, as in "what does scratch that do", is ordinary
+text.
+
 **Mode line.**
 
 | Text          | State     |
@@ -191,7 +200,8 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 | `codec-preamble-position`   | `prepend`       | `prepend` or `append` the preamble. |
 | `codec-spoken-open`         | `"<spoken>"`    | Tag that opens the spoken summary. |
 | `codec-spoken-close`        | `"</spoken>"`   | Tag that closes the spoken summary. |
-| `codec-cancel-phrases`      | `("scratch that" "cancel")` | Utterances that discard instead of send. |
+| `codec-cancel-phrases`      | `("scratch that" "cancel")` | Whole utterances that discard the queue. |
+| `codec-cancel-trailing-phrases` | `("scratch that" "never mind")` | Phrases that discard the utterance they end. |
 | `codec-mode-line-states`    | see above       | Mode line text for each state. |
 | `codec-after-send-functions`| `nil`           | Called with the buffer and transcript after each voice prompt. |
 | `codec-tts-backend`         | `say`           | `say`, `piper`, or `nil` to speak nothing. |

@@ -122,6 +122,14 @@ The built-in list holds the phrases Whisper invents on silence, such
 as \"you\" and \"Thank you.\".  Case and punctuation do not matter."
   :type '(repeat string))
 
+(defcustom codec-filler-words nil
+  "Filler words for the listener, as well as its built-in list.
+The listener drops a transcript whose words are all filler words.
+The built-in list holds hesitation sounds such as \"um\", \"uh\" and
+\"hmm\".  A transcript with any other word, such as \"Um, run the
+tests\", is sent.  Case and punctuation do not matter."
+  :type '(repeat string))
+
 (defcustom codec-listener-extra-args nil
   "More arguments for the listener, such as (\"--beam-size\" \"1\").
 Run the listener with --help for the full list."
@@ -873,6 +881,8 @@ After Piper, play its file; after the last step, unmute the listener."
                 "--silence-ms" (number-to-string codec-silence-ms))
           (mapcan (lambda (phrase) (list "--drop-phrase" phrase))
                   (copy-sequence codec-drop-phrases))
+          (mapcan (lambda (word) (list "--filler-word" word))
+                  (copy-sequence codec-filler-words))
           codec-listener-extra-args))
 
 (defun codec--make-process ()

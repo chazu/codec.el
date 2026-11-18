@@ -751,12 +751,21 @@ STOP-REASON defaults to \"end_turn\"."
         (codec-compute-type 'auto)
         (codec-silence-ms 700)
         (codec-drop-phrases '("okay" "bye"))
+        (codec-filler-words '("like" "so"))
         (codec-listener-extra-args '("--beam-size" "1")))
     (should (equal (codec--listener-arguments)
                    '("--model" "base.en" "--device" "auto"
                      "--compute-type" "auto" "--silence-ms" "700"
                      "--drop-phrase" "okay" "--drop-phrase" "bye"
+                     "--filler-word" "like" "--filler-word" "so"
                      "--beam-size" "1")))))
+
+(ert-deftest codec-test-listener-arguments-no-filler-words ()
+  (let ((codec-drop-phrases nil)
+        (codec-filler-words nil)
+        (codec-listener-extra-args nil))
+    (should (eq (default-value 'codec-filler-words) nil))
+    (should-not (member "--filler-word" (codec--listener-arguments)))))
 
 (ert-deftest codec-test-listener-arguments-device ()
   (let ((codec-drop-phrases nil)

@@ -162,7 +162,7 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
   (codec-model "base.en")               ; faster, less accurate
   (codec-silence-ms 1200)               ; wait longer before sending
   (codec-drop-phrases '("okay"))        ; more noise to drop
-  (codec-listener-extra-args '("--device" "mps"))
+  (codec-device 'cpu)                   ; skip the Apple GPU
   (codec-cancel-phrases '("scratch that" "never mind"))
   (codec-say-voice "Samantha")          ; say -v '?' lists the voices
   (codec-say-rate 220)                  ; words per minute
@@ -173,6 +173,8 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 | Option                      | Default         | Purpose |
 |-----------------------------|-----------------|---------|
 | `codec-model`               | `"small.en"`    | faster-whisper model name or path. |
+| `codec-device`              | `auto`          | `auto`, `mps`, `cpu`, or another CTranslate2 device. |
+| `codec-compute-type`        | `auto`          | `auto`, or a CTranslate2 compute type such as `int8`. |
 | `codec-silence-ms`          | `900`           | Silence that ends an utterance. |
 | `codec-drop-phrases`        | `nil`           | Transcripts to drop, besides the built-in list. |
 | `codec-listener-extra-args` | `nil`           | More listener options (`--help` lists them). |
@@ -217,15 +219,41 @@ default:
 The listener uses **faster-whisper** (CTranslate2), not mlx-whisper:
 
 - Utterances are short, and the models are small (`small.en`,
-  `base.en`). int8 on an Apple Silicon CPU is fast enough for that.
-  The GPU speed of mlx-whisper matters most for long audio and large
-  models.
+  `base.en`). CTranslate2's Metal backend (below) makes them fast on
+  Apple Silicon. The GPU speed of mlx-whisper matters most for long
+  audio and large models.
 - faster-whisper ships the Silero VAD model as ONNX. The listener runs
   it with onnxruntime, so there is no PyTorch download.
 - It runs the same on Linux and macOS.
 
-CTranslate2 4.9 also has an experimental Metal backend. To try it, set
-`codec-listener-extra-args` to `("--device" "mps")`.
+### Apple Silicon
+
+On macOS on Apple Silicon, `codec-device` `auto` uses CTranslate2's
+experimental Metal backend (`mps`). CTranslate2's own `auto` never
+picks it, so the listener does. Elsewhere, `auto` is CTranslate2's
+choice (CUDA or the CPU).
+
+`codec-compute-type` `auto` means `int8_float16` on `mps` (CTranslate2
+runs it as `float16`) and `int8` on the CPU.
+
+Measured with `small.en` on a 7.3 s clip, on one Apple Silicon Mac
+(2026-11-18). All three gave the same transcript:
+
+| Device and compute type | First run | Best run |
+|-------------------------|-----------|----------|
+| `cpu`, `int8`           |           | 1.19 s   |
+| `mps`, `float16`        | 0.84 s    | 0.38 s   |
+| `mps`, `int8_float16`   | 0.40 s    | 0.38 s   |
+
+If the model does not load on `mps`, the listener logs the reason and
+uses `cpu` with `int8`. The `ready` event and `*codec-listener-log*`
+show the device it uses. To use the CPU always:
+
+```elisp
+(setq codec-device 'cpu)
+```
+
+From a shell, give the listener `--device cpu`.
 
 ## Spoken replies
 
@@ -302,7 +330,7 @@ uv run --project listener python listener/codec_listener.py --help
 **Stdout** has one JSON object per line and nothing else:
 
 ```json
-{"type":"ready"}
+{"type":"ready","device":"mps","compute_type":"int8_float16"}
 {"type":"listening"}
 {"type":"muted"}
 {"type":"stopped"}
@@ -310,7 +338,9 @@ uv run --project listener python listener/codec_listener.py --help
 {"type":"error","message":"microphone failed: ..."}
 ```
 
-`ready` comes once, after the model loads. `listening`, `muted` and
+`ready` comes once, after the model loads. It names the device the
+model runs on and the compute type. Readers must ignore keys they do
+not know. `listening`, `muted` and
 `stopped` come after each state change. An `error` followed by exit is
 fatal; other errors (one bad transcription) are not.
 
@@ -345,6 +375,13 @@ The ERT tests use `test/fake-listener.sh` in place of the listener,
 `test/fake-tts.sh` in place of say, Piper and the audio player, and
 stub the agent-shell functions. They play no audio. The Python tests feed synthetic frames
 and fake models to the listener.
+
+## Known issues
+
+- With faster-whisper 1.2.1 and the PyAV in `listener/uv.lock`,
+  `WhisperModel.transcribe` on a file path fails with `TypeError:
+  open() got an unexpected keyword argument 'metadata_errors'`; the
+  listener gives it NumPy arrays, so it is not affected.
 
 ## Next
 

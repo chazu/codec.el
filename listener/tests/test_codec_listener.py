@@ -318,5 +318,116 @@ def test_parser_defaults():
     args = cl.build_parser().parse_args([])
     assert args.model == "small.en"
     assert args.silence_ms == 900
+    assert args.device == "auto"
+    assert args.compute_type == "auto"
     args = cl.build_parser().parse_args(["--drop-phrase", "okay", "--drop-phrase", "bye"])
     assert args.drop_phrase == ["okay", "bye"]
+
+
+# --- Device ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "device, compute_type, system, machine, expected",
+    [
+        ("auto", "auto", "Darwin", "arm64", ("mps", "int8_float16")),
+        ("auto", "auto", "Darwin", "x86_64", ("auto", "int8")),
+        ("auto", "auto", "Linux", "x86_64", ("auto", "int8")),
+        ("auto", "auto", "Linux", "aarch64", ("auto", "int8")),
+        ("cpu", "auto", "Darwin", "arm64", ("cpu", "int8")),
+        ("cuda", "auto", "Linux", "x86_64", ("cuda", "default")),
+        ("mps", "float16", "Darwin", "arm64", ("mps", "float16")),
+        ("auto", "float32", "Darwin", "arm64", ("mps", "float32")),
+        ("cpu", "int8_float32", "Linux", "x86_64", ("cpu", "int8_float32")),
+    ],
+)
+def test_resolve_device(device, compute_type, system, machine, expected):
+    assert cl.resolve_device(device, compute_type, system, machine) == expected
+
+
+class FakeLoader:
+    """Record each load; fail on the devices in FAIL_ON."""
+
+    def __init__(self, fail_on=(), reported=None):
+        self.calls = []
+        self.fail_on = fail_on
+        self.reported = reported
+
+    def __call__(self, device, compute_type, **kwargs):
+        self.calls.append((device, compute_type, kwargs))
+        if device in self.fail_on:
+            raise RuntimeError(f"no {device} here")
+        transcriber = lambda audio: "text"  # noqa: E731
+        transcriber.device = self.reported or device
+        return transcriber
+
+
+def test_load_transcriber_uses_mps_when_it_loads():
+    loader = FakeLoader()
+    _t, device, compute_type = cl.load_transcriber(
+        loader, "mps", "int8_float16", model="tiny.en"
+    )
+    assert (device, compute_type) == ("mps", "int8_float16")
+    assert loader.calls == [("mps", "int8_float16", {"model": "tiny.en"})]
+
+
+def test_load_transcriber_falls_back_to_cpu_when_mps_fails(caplog):
+    loader = FakeLoader(fail_on=("mps",))
+    transcriber, device, compute_type = cl.load_transcriber(
+        loader, "mps", "int8_float16", model="tiny.en"
+    )
+    assert (device, compute_type) == ("cpu", "int8")
+    assert [c[:2] for c in loader.calls] == [("mps", "int8_float16"), ("cpu", "int8")]
+    assert transcriber(None) == "text"
+    assert "no mps here" in caplog.text
+
+
+def test_load_transcriber_does_not_fall_back_from_other_devices():
+    loader = FakeLoader(fail_on=("cuda",))
+    with pytest.raises(RuntimeError):
+        cl.load_transcriber(loader, "cuda", "default")
+    assert len(loader.calls) == 1
+
+
+def test_load_transcriber_reports_the_device_auto_picked():
+    _t, device, _c = cl.load_transcriber(FakeLoader(reported="cpu"), "auto", "int8")
+    assert device == "cpu"
+
+
+def run_download_only(monkeypatch, loader, system="Darwin", machine="arm64", args=()):
+    monkeypatch.setattr(cl.platform, "system", lambda: system)
+    monkeypatch.setattr(cl.platform, "machine", lambda: machine)
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    code = cl.main(["--download-only", *args], loader=loader, make_vad=lambda: None)
+    return code, [json.loads(line) for line in out.getvalue().splitlines()]
+
+
+def test_ready_event_names_device_and_compute_type(monkeypatch):
+    code, events = run_download_only(monkeypatch, FakeLoader())
+    assert code == 0
+    assert events == [{"type": "ready", "device": "mps", "compute_type": "int8_float16"}]
+
+
+def test_ready_event_after_mps_fallback(monkeypatch):
+    code, events = run_download_only(monkeypatch, FakeLoader(fail_on=("mps",)))
+    assert code == 0
+    assert events == [{"type": "ready", "device": "cpu", "compute_type": "int8"}]
+
+
+def test_explicit_device_and_compute_type_are_passed_through(monkeypatch):
+    loader = FakeLoader()
+    code, events = run_download_only(
+        monkeypatch, loader, args=("--device", "cpu", "--compute-type", "float32")
+    )
+    assert loader.calls[0][:2] == ("cpu", "float32")
+    assert events == [{"type": "ready", "device": "cpu", "compute_type": "float32"}]
+
+
+def test_load_failure_on_cpu_is_an_error_event(monkeypatch):
+    code, events = run_download_only(
+        monkeypatch, FakeLoader(fail_on=("mps", "cpu"))
+    )
+    assert code == 1
+    assert [e["type"] for e in events] == ["error"]
+    assert "no cpu here" in events[0]["message"]

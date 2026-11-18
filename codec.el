@@ -96,6 +96,22 @@ faster and less accurate.  The model is downloaded on first use; see
 `codec-download-model'."
   :type 'string)
 
+(defcustom codec-device 'auto
+  "The device that runs the Whisper model.
+auto means the Apple GPU (mps) on Apple Silicon, and CTranslate2's
+own choice elsewhere.  If the model fails to load on mps, the
+listener uses the CPU."
+  :type '(choice (const :tag "Automatic" auto)
+                 (const :tag "Apple GPU" mps)
+                 (const :tag "CPU" cpu)
+                 (string :tag "Other CTranslate2 device")))
+
+(defcustom codec-compute-type 'auto
+  "The CTranslate2 compute type of the Whisper model.
+auto means int8_float16 on mps and int8 on the CPU."
+  :type '(choice (const :tag "Automatic" auto)
+                 (string :tag "Compute type")))
+
 (defcustom codec-silence-ms 900
   "Milliseconds of silence that end an utterance."
   :type 'natnum)
@@ -107,7 +123,7 @@ as \"you\" and \"Thank you.\".  Case and punctuation do not matter."
   :type '(repeat string))
 
 (defcustom codec-listener-extra-args nil
-  "More arguments for the listener, such as (\"--device\" \"mps\").
+  "More arguments for the listener, such as (\"--beam-size\" \"1\").
 Run the listener with --help for the full list."
   :type '(repeat string))
 
@@ -170,6 +186,8 @@ the preamble."
 (defvar codec--process nil "The listener process.")
 (defvar codec--stderr-process nil "The pipe that carries the listener's stderr.")
 (defvar codec--ready nil "Non-nil once the listener said it is ready.")
+(defvar codec--device nil
+  "The device and compute type of the listener, such as \"mps, float16\".")
 (defvar codec--muted nil "Non-nil while voice input is muted.")
 (defvar codec--muted-for-target nil
   "Non-nil if codec muted itself because it had no live target.")
@@ -230,9 +248,11 @@ One of the symbols off, starting, listening, muted, speaking or error."
                         ('error 'error)
                         ('listening 'success)
                         (_ nil))
-                'help-echo (if codec--error
-                               (format "codec: %s" codec--error)
-                             (format "codec: %s" state)))))
+                'help-echo (cond (codec--error
+                                  (format "codec: %s" codec--error))
+                                 (codec--device
+                                  (format "codec: %s on %s" state codec--device))
+                                 (t (format "codec: %s" state))))))
 
 (defun codec--start ()
   "Start the listener and choose the target."
@@ -257,6 +277,7 @@ One of the symbols off, starting, listening, muted, speaking or error."
   (setq codec--target nil
         codec--queue nil
         codec--ready nil
+        codec--device nil
         codec--muted nil
         codec--muted-for-target nil
         codec--error nil
@@ -847,6 +868,8 @@ After Piper, play its file; after the last step, unmute the listener."
 (defun codec--listener-arguments ()
   "Return the listener options made from the customization options."
   (append (list "--model" codec-model
+                "--device" (format "%s" codec-device)
+                "--compute-type" (format "%s" codec-compute-type)
                 "--silence-ms" (number-to-string codec-silence-ms))
           (mapcan (lambda (phrase) (list "--drop-phrase" phrase))
                   (copy-sequence codec-drop-phrases))
@@ -934,7 +957,7 @@ The listener stays muted while codec speaks."
 (defun codec--handle-event (event)
   "Act on the listener EVENT, a plist."
   (pcase (plist-get event :type)
-    ("ready" (setq codec--ready t))
+    ("ready" (codec--handle-ready event))
     ("utterance" (codec--handle-utterance (plist-get event :text)))
     ("error"
      (let ((text (or (plist-get event :message) "unknown error")))
@@ -944,6 +967,22 @@ The listener stays muted while codec speaks."
     ((or "listening" "muted" "stopped"))
     (type (codec--log "unknown event: %s" type)))
   (force-mode-line-update t))
+
+(defun codec--handle-ready (event)
+  "Note that the listener is ready, and on which device, from EVENT.
+The device and compute type are absent from older listeners."
+  (setq codec--ready t
+        codec--device (let ((device (plist-get event :device))
+                            (type (plist-get event :compute_type)))
+                        (and (stringp device)
+                             (if (stringp type)
+                                 (format "%s, %s" device type)
+                               device))))
+  (codec--log "ready on %s" (or codec--device "an unknown device"))
+  ;; Keep the hint that `codec--mute-for-target' showed.
+  (unless codec--muted-for-target
+    (message "codec: ready%s"
+             (if codec--device (format " on %s" codec--device) ""))))
 
 (defun codec--sentinel (process event)
   "Report an unexpected exit of the listener PROCESS with EVENT."

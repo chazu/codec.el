@@ -6,7 +6,8 @@ as a subprocess and talks to it over pipes.
 
 Stdout carries one JSON object per line and nothing else:
 
-    {"type": "ready"}                  model loaded, about to capture
+    {"type": "ready", "device": "mps", "compute_type": "int8_float16"}
+                                       model loaded, about to capture
     {"type": "listening"}              capturing, not muted
     {"type": "muted"}                  muted: audio is discarded
     {"type": "stopped"}                capture is off (push-to-talk seam)
@@ -23,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import platform
 import queue
 import re
 import sys
@@ -240,6 +242,59 @@ class SileroVAD:
         return float(out[0])
 
 
+# The compute type that "auto" means on each device.  On MPS, CTranslate2
+# runs int8_float16 as float16; on the CPU, int8 is the fastest.
+AUTO_COMPUTE_TYPES = {"mps": "int8_float16", "cpu": "int8", "auto": "int8"}
+FALLBACK = ("cpu", "int8")
+
+
+def resolve_device(
+    device: str,
+    compute_type: str,
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> tuple:
+    """Return the (device, compute type) to try first.
+
+    Device "auto" means "mps" on Apple Silicon and CTranslate2's own
+    choice elsewhere, because CTranslate2's "auto" never picks MPS.
+    Compute type "auto" means the entry for the device in
+    AUTO_COMPUTE_TYPES, else CTranslate2's "default".  Other values are
+    used as given.
+    """
+    system = platform.system() if system is None else system
+    machine = platform.machine() if machine is None else machine
+    if device == "auto" and system == "Darwin" and machine == "arm64":
+        device = "mps"
+    if compute_type == "auto":
+        compute_type = AUTO_COMPUTE_TYPES.get(device, "default")
+    return device, compute_type
+
+
+def load_transcriber(
+    loader: Callable[..., Callable[[np.ndarray], str]],
+    device: str,
+    compute_type: str,
+    **kwargs: object,
+) -> tuple:
+    """Return (transcriber, device, compute type) from LOADER.
+
+    LOADER takes DEVICE, COMPUTE_TYPE and KWARGS as keywords.  If it
+    fails on MPS, log why and load on the CPU instead.  The device
+    returned is the one the model reports, if it reports one, so that
+    "auto" becomes "cpu" or "cuda".
+    """
+    try:
+        transcriber = loader(device=device, compute_type=compute_type, **kwargs)
+    except Exception as e:
+        if device != "mps":
+            raise
+        log.warning("cannot load the model on mps (%s); using %s/%s", e, *FALLBACK)
+        device, compute_type = FALLBACK
+        transcriber = loader(device=device, compute_type=compute_type, **kwargs)
+    return transcriber, getattr(transcriber, "device", None) or device, compute_type
+
+
 class WhisperTranscriber:
     """Transcribe one utterance with faster-whisper."""
 
@@ -254,11 +309,17 @@ class WhisperTranscriber:
     ):
         from faster_whisper import WhisperModel
 
+        # CTranslate2 logs, such as its tip to try MPS, go to stderr.
         self._model = WhisperModel(
             model, device=device, compute_type=compute_type, download_root=download_root
         )
         self._language = language
         self._beam_size = beam_size
+
+    @property
+    def device(self) -> Optional[str]:
+        """The device the model runs on, such as "mps" or "cpu"."""
+        return getattr(self._model.model, "device", None)
 
     def __call__(self, audio: np.ndarray) -> str:
         segments, _info = self._model.transcribe(
@@ -409,8 +470,14 @@ class Listener:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", default="small.en", help="Whisper model name or path")
-    p.add_argument("--device", default="auto", help="cpu, cuda or auto")
-    p.add_argument("--compute-type", default="int8", help="CTranslate2 compute type")
+    p.add_argument(
+        "--device", default="auto", help="mps, cpu, cuda or auto (mps on Apple Silicon)"
+    )
+    p.add_argument(
+        "--compute-type",
+        default="auto",
+        help="CTranslate2 compute type, or auto (int8_float16 on mps, int8 on cpu)",
+    )
     p.add_argument("--language", default="en", help="language code, or '' to detect")
     p.add_argument("--beam-size", type=int, default=5)
     p.add_argument("--download-root", default=None, help="model cache directory")
@@ -456,7 +523,12 @@ def _transcribe_forever(listener: Listener) -> None:
         listener.transcribe_next()
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(
+    argv: Optional[list] = None,
+    loader: Callable[..., Callable[[np.ndarray], str]] = WhisperTranscriber,
+    make_vad: Callable[[], Callable[[np.ndarray], float]] = SileroVAD,
+) -> int:
+    """Run the listener.  LOADER and MAKE_VAD load the models."""
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         stream=sys.stderr,
@@ -493,23 +565,26 @@ def main(argv: Optional[list] = None) -> int:
             target=_read_commands, args=(listener, ready, sys.stdin), daemon=True
         ).start()
 
+    device, compute_type = resolve_device(args.device, args.compute_type)
     try:
-        log.info("loading Whisper model %s", args.model)
-        listener.transcriber = WhisperTranscriber(
-            args.model,
-            device=args.device,
-            compute_type=args.compute_type,
+        log.info("loading Whisper model %s on %s/%s", args.model, device, compute_type)
+        listener.transcriber, device, compute_type = load_transcriber(
+            loader,
+            device,
+            compute_type,
+            model=args.model,
             language=args.language or None,
             beam_size=args.beam_size,
             download_root=args.download_root,
         )
-        listener.vad = SileroVAD()
+        log.info("model loaded on %s/%s", device, compute_type)
+        listener.vad = make_vad()
     except Exception as e:
         log.exception("model load failed")
         emit("error", message=f"model load failed: {e}")
         return 1
     if args.download_only:
-        emit("ready")
+        emit("ready", device=device, compute_type=compute_type)
         return 0
 
     def on_audio(data, _frames, _time, status):
@@ -535,7 +610,7 @@ def main(argv: Optional[list] = None) -> int:
         return 1
 
     ready.set()
-    emit("ready")
+    emit("ready", device=device, compute_type=compute_type)
     listener.emit_state()
     threading.Thread(target=_transcribe_forever, args=(listener,), daemon=True).start()
     try:

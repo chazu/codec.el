@@ -37,9 +37,10 @@ speaker ◄─ say or Piper ◄─ <spoken> summary ◄─────┘
 4. codec adds `codec-voice-preamble` to the transcript and submits it
    in the target agent-shell buffer. If the agent is in a turn, codec
    queues the utterance and sends it when the turn completes.
-5. The preamble asks the agent to end its reply with a summary between
-   `<spoken>` and `</spoken>`. When the turn completes, codec speaks
-   that summary and mutes the listener while it speaks. See [Spoken
+5. The preamble asks the agent to begin its reply with a summary
+   between `<spoken>` and `</spoken>`. When the summary has streamed
+   in, codec speaks it and mutes the listener while it speaks. The
+   agent writes the rest of the reply at the same time. See [Spoken
    replies](#spoken-replies).
 
 ## Requirements
@@ -196,7 +197,8 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 | `codec-drop-phrases`        | `nil`           | Transcripts to drop, besides the built-in list. |
 | `codec-filler-words`        | `nil`           | Filler words, besides the built-in list. A transcript of only filler words is dropped. |
 | `codec-listener-extra-args` | `nil`           | More listener options (`--help` lists them). |
-| `codec-voice-preamble`      | see below       | Instructions added to each voice prompt. `%o`/`%c` are the tags. |
+| `codec-spoken-position`     | `top`           | `top` or `bottom`: where the agent puts the summary. See [Summary position](#summary-position). |
+| `codec-voice-preamble`      | `nil` (built in)| Instructions added to each voice prompt. `%o`/`%c` are the tags. |
 | `codec-preamble-position`   | `prepend`       | `prepend` or `append` the preamble. |
 | `codec-spoken-open`         | `"<spoken>"`    | Tag that opens the spoken summary. |
 | `codec-spoken-close`        | `"</spoken>"`   | Tag that closes the spoken summary. |
@@ -223,8 +225,19 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 
 ### The voice preamble
 
-Only voice prompts get the preamble. Typed prompts stay as they are. The
-default:
+Only voice prompts get the preamble. Typed prompts stay as they are.
+When `codec-voice-preamble` is `nil` (the default), codec uses the
+built-in text for `codec-spoken-position`, from
+`codec-voice-preambles`. For `top`:
+
+> [voice] The user is speaking to you hands-free and will hear only a
+> short spoken summary. Begin your reply with `<spoken>`one or two
+> plain, speakable sentences: the result and the one thing the user
+> should do next`</spoken>`. Then answer normally in full. No code,
+> paths or markdown inside `<spoken>`. The transcript below may have
+> speech-recognition errors.
+
+For `bottom`:
 
 > [voice] The user is speaking to you hands-free and will hear only a
 > short spoken summary. Answer normally in full. Then end your reply
@@ -232,6 +245,10 @@ default:
 > the one thing the user should do next`</spoken>`. No code, paths or
 > markdown inside `<spoken>`. The transcript below may have
 > speech-recognition errors.
+
+Set `codec-voice-preamble` to a string to use your own text. Your text
+then does not change with `codec-spoken-position`, so make sure that it
+asks for the summary in the same position.
 
 ### Model choice
 
@@ -281,21 +298,45 @@ not.
 
 1. codec collects the text of the reply from agent-shell's
    `agent-message-chunk` events.
-2. When the turn completes, codec finds the **last** block between
-   `codec-spoken-open` and `codec-spoken-close`. A tag can be split
-   across chunks.
+2. codec finds the block between `codec-spoken-open` and
+   `codec-spoken-close`. A tag can be split across chunks. Which block,
+   and when, depends on `codec-spoken-position`; see [Summary
+   position](#summary-position).
 3. codec removes markdown and code from the block and cuts it to
    `codec-spoken-max-chars`.
 4. If the reply has no block, codec says `codec-no-summary-text`
-   ("Reply ready."). If the turn was cancelled, codec says nothing.
+   ("Reply ready.") when the turn completes. If the turn was cancelled
+   before codec started to speak, codec says nothing.
 5. codec mutes the listener, speaks, and unmutes the listener when the
    speech ends. If you muted with `codec-mute`, codec does not unmute.
 6. A new summary stops the summary that is playing.
 
 The speech runs in a subprocess. Emacs does not wait for it.
 
-In the buffer, the `<spoken>` block stays visible, in
-`codec-spoken-face` (dim). Set `codec-hide-spoken` to `t` to make it
+### Summary position
+
+`codec-spoken-position` has two values:
+
+| Value    | The agent puts the summary | codec speaks |
+|----------|----------------------------|--------------|
+| `top`    | first in the reply         | the **first** block, as soon as its close tag streams in |
+| `bottom` | last in the reply          | the **last** block, when the turn completes |
+
+With `top` (the default), you hear the summary a few seconds after the
+agent starts to reply. You do not wait for the full reply, tool calls
+and all. codec speaks one summary for each voice prompt, and ignores
+the blocks that come after it. The end of the turn does not stop or
+restart that speech.
+
+If the speech ends while the agent still writes, codec unmutes the
+listener. Utterances that you speak then wait in the queue, and go to
+the agent when its turn completes.
+
+With `bottom`, the summary can describe the full reply, but you hear it
+only after the agent has finished.
+
+In the buffer, the `<spoken>` block stays visible. When the turn
+completes, codec shows it in `codec-spoken-face` (dim). Set `codec-hide-spoken` to `t` to make it
 invisible. codec uses an overlay and does not change the buffer text.
 
 ### say (default)

@@ -38,11 +38,17 @@
 ;;
 ;; Each voice prompt gets `codec-voice-preamble', which asks the agent
 ;; to end its reply with a short summary between `codec-spoken-open'
-;; and `codec-spoken-close'.  Typed prompts are left alone.
+;; and `codec-spoken-close'.  Typed prompts are left alone.  When the
+;; agent finishes a reply to a voice prompt, codec speaks that summary
+;; with `codec-tts-backend' (macOS say, or Piper) and mutes the listener
+;; while it speaks.
 ;;
 ;; Suggested binding, for a foot pedal that sends S-<f12>:
 ;;
-;;   (keymap-global-set "S-<f12>" #'codec-mode)
+;;   (keymap-global-set "S-<f12>" #'codec-pedal)
+;;
+;; The pedal stops the speech if codec speaks, and otherwise toggles
+;; `codec-mode'.
 ;;
 ;; See README.md for setup, the microphone permission on macOS, and
 ;; the listener protocol.
@@ -157,6 +163,7 @@ punctuation."
     (starting . " Codec:…")
     (listening . " Codec:on")
     (muted . " Codec:muted")
+    (speaking . " Codec:speaking")
     (error . " Codec:err"))
   "Mode line text for each state of `codec-mode'."
   :type '(alist :key-type symbol :value-type string))
@@ -206,11 +213,17 @@ current, or else the one selected most recently; change it with
 and go out when the turn completes.  Say a phrase in
 `codec-cancel-phrases' to discard them.
 
+When the agent replies to a voice prompt, codec speaks the summary
+in the reply with `codec-tts-backend', and mutes the listener while
+it speaks.  Typed prompts get no speech.
+
 \\[codec-mute] and \\[codec-unmute] pause and resume listening.
+\\[codec-stop-speaking] stops the speech at once, and \\[codec-pedal]
+does that or toggles the mode.
 
 For a foot pedal that sends S-<f12>:
 
-  (keymap-global-set \"S-<f12>\" #\\='codec-mode)"
+  (keymap-global-set \"S-<f12>\" #\\='codec-pedal)"
   :global t
   :lighter (:eval (codec--mode-line))
   (if codec-mode
@@ -219,10 +232,11 @@ For a foot pedal that sends S-<f12>:
 
 (defun codec-state ()
   "Return the state of `codec-mode'.
-One of the symbols off, starting, listening, muted or error."
+One of the symbols off, starting, listening, muted, speaking or error."
   (cond ((not codec-mode) 'off)
         (codec--error 'error)
         ((not codec--ready) 'starting)
+        ((codec--speaking-p) 'speaking)
         (codec--muted 'muted)
         (t 'listening)))
 
@@ -255,7 +269,9 @@ One of the symbols off, starting, listening, muted or error."
   (force-mode-line-update t))
 
 (defun codec--stop ()
-  "Stop the listener and forget the target and the queue."
+  "Stop the listener and the speech, and forget the target and the queue."
+  (codec--reset-speech)
+  (codec--drop-voice-turn)
   (codec--unsubscribe)
   (codec--stop-process)
   (setq codec--target nil
@@ -351,13 +367,22 @@ the listener works offline."
   "Make BUFFER the target and subscribe to its events.
 BUFFER nil means no target."
   (codec--unsubscribe)
+  (codec--drop-voice-turn)
   (setq codec--target buffer)
   (when buffer
-    (dolist (event '(turn-complete prompt-ready))
-      (codec--subscribe buffer event
-                        (lambda (_event)
-                          ;; Not from inside agent-shell's own handling.
-                          (run-at-time 0 nil #'codec--flush))))
+    ;; Not from inside agent-shell's own handling.
+    (codec--subscribe buffer 'turn-complete
+                      (lambda (event)
+                        (run-at-time 0 nil #'codec--turn-complete buffer
+                                     (alist-get :data event))))
+    (codec--subscribe buffer 'prompt-ready
+                      (lambda (_event)
+                        (run-at-time 0 nil #'codec--flush)))
+    (codec--subscribe buffer 'agent-message-chunk
+                      (lambda (event)
+                        (codec--add-chunk
+                         buffer (alist-get :text-chunk
+                                           (alist-get :data event)))))
     (codec--subscribe buffer 'clean-up
                       (lambda (_event)
                         (run-at-time 0 nil #'codec--check-target)))))
@@ -463,7 +488,357 @@ They go as one voice prompt."
         (let ((agent-shell-prefer-viewport-interaction nil))
           (agent-shell-insert :text (codec-wrap-transcript transcript)
                               :submit t :no-focus t :shell-buffer buffer)))
+      (codec--begin-voice-turn buffer)
       (run-hook-with-args 'codec-after-send-functions buffer transcript)))))
+
+;;;; Spoken replies
+
+(defface codec-spoken-face
+  '((t :inherit shadow))
+  "Face of the spoken summary in an agent-shell buffer.")
+
+(defcustom codec-hide-spoken nil
+  "Non-nil means make the spoken summary in the buffer invisible.
+nil shows it with `codec-spoken-face'.  The buffer text does not
+change either way."
+  :type 'boolean)
+
+(defcustom codec-spoken-max-chars 400
+  "The longest summary codec speaks, in characters.
+A longer summary is cut at a sentence end or a word.  nil means no
+limit."
+  :type '(choice (const :tag "No limit" nil) natnum))
+
+(defcustom codec-no-summary-text "Reply ready."
+  "What codec says when a reply to a voice prompt has no summary.
+nil means say nothing."
+  :type '(choice (const :tag "Nothing" nil) string))
+
+(defvar codec--voice-turn nil
+  "The reply to the last voice prompt, while the agent writes it.
+A plist with :buffer, the agent-shell buffer; :chunks, the text
+chunks so far, newest first; and :start, a marker at the start of the
+reply, or nil before the first chunk.")
+
+(defun codec--begin-voice-turn (buffer)
+  "Start to collect the reply in BUFFER to a voice prompt."
+  (codec--drop-voice-turn)
+  (setq codec--voice-turn (list :buffer buffer :chunks nil :start nil)))
+
+(defun codec--drop-voice-turn ()
+  "Forget the voice turn in progress, if any."
+  (when-let* ((start (plist-get codec--voice-turn :start)))
+    (set-marker start nil))
+  (setq codec--voice-turn nil))
+
+(defun codec--add-chunk (buffer chunk)
+  "Add the text CHUNK of the reply in BUFFER if it is a voice turn.
+CHUNK is nil for a block that is not text."
+  (let ((turn codec--voice-turn))
+    (when (and turn (eq buffer (plist-get turn :buffer)) (stringp chunk))
+      (unless (plist-get turn :start)
+        (setq turn (plist-put turn :start (with-current-buffer buffer
+                                            (copy-marker (point-max))))))
+      (setq codec--voice-turn
+            (plist-put turn :chunks (cons chunk (plist-get turn :chunks)))))))
+
+(defun codec--turn-complete (buffer data)
+  "Speak the reply in BUFFER if it was a voice turn, then send the queue.
+DATA is the data of agent-shell's turn-complete event."
+  (when codec-mode
+    (codec--finish-voice-turn buffer data))
+  (codec--flush))
+
+(defun codec--finish-voice-turn (buffer data)
+  "Speak the summary of the voice turn in BUFFER and mark it in BUFFER.
+DATA is the data of the turn-complete event.  Speak nothing if the
+turn was cancelled."
+  (let ((turn codec--voice-turn))
+    (when (and turn (eq buffer (plist-get turn :buffer)))
+      (let* ((text (apply #'concat (reverse (plist-get turn :chunks))))
+             (spoken (codec-extract-spoken text))
+             (speech (and spoken (codec--speakable spoken)))
+             (start (plist-get turn :start)))
+        (when (and spoken start (buffer-live-p buffer))
+          (codec--mark-spoken buffer start))
+        (codec--drop-voice-turn)
+        (unless (equal (alist-get :stop-reason data) "cancelled")
+          (cond ((and speech (not (string-empty-p speech)))
+                 (codec-speak speech))
+                (codec-no-summary-text
+                 (codec-speak codec-no-summary-text))))))))
+
+(defun codec--last-index (needle haystack &optional end)
+  "Return where the last NEEDLE in HAYSTACK starts, or nil.
+With END, the match must end at or before END."
+  (unless (string-empty-p needle)
+    (let ((pos 0) last)
+      (while (and (setq pos (string-search needle haystack pos))
+                  (or (null end) (<= (+ pos (length needle)) end)))
+        (setq last pos
+              pos (1+ pos)))
+      last)))
+
+(defun codec-extract-spoken (text)
+  "Return the text of the last spoken summary in TEXT, or nil.
+The summary is between `codec-spoken-open' and `codec-spoken-close'."
+  (when-let* ((close (codec--last-index codec-spoken-close text))
+              (open (codec--last-index codec-spoken-open text close)))
+    (substring text (+ open (length codec-spoken-open)) close)))
+
+(defun codec--speakable (text)
+  "Return TEXT without markdown or code, at most `codec-spoken-max-chars' long."
+  (let ((text text))
+    (pcase-dolist (`(,regexp . ,replacement)
+                   '(("```\\(?:.\\|\n\\)*?```" . " ")           ; code blocks
+                     ("`\\([^`\n]*\\)`" . "\\1")                 ; inline code
+                     ("!?\\[\\([^]\n]*\\)\\]([^)\n]*)" . "\\1") ; links
+                     ("<[^<>\n]*>" . " ")                       ; tags
+                     ("^[ \t]*\\(?:#+\\|>+\\|[-*+]\\|[0-9]+[.)]\\)[ \t]+" . "")
+                     ("[*`~]+" . "")
+                     ("_+" . " ")
+                     ("[[:space:]]+" . " ")
+                     ("\\`[ -]+\\| +\\'" . "")))
+      (setq text (replace-regexp-in-string regexp replacement text t)))
+    (codec--cap text codec-spoken-max-chars)))
+
+(defun codec--cap (text max)
+  "Return TEXT cut to at most MAX characters at a sentence end or a word.
+MAX nil means no limit."
+  (if (or (null max) (<= (length text) max))
+      text
+    (let ((cut (substring text 0 max))
+          (start 0)
+          sentence-end)
+      (while (string-match "[.!?]\\(?: \\|\\'\\)" cut start)
+        (setq sentence-end (1+ (match-beginning 0))
+              start (match-end 0)))
+      (string-trim-right
+       (cond ((and sentence-end (> sentence-end (/ max 2)))
+              (substring cut 0 sentence-end))
+             ((string-match " [^ ]*\\'" cut)
+              (substring cut 0 (match-beginning 0)))
+             (t cut))))))
+
+(defun codec--mark-spoken (buffer start)
+  "Give the last spoken summary in BUFFER after START an overlay.
+The overlay has `codec-spoken-face', and is invisible if
+`codec-hide-spoken' is non-nil.  Return the overlay, or nil."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-max))
+      (let ((case-fold-search nil))
+        (when-let* ((end (and (search-backward codec-spoken-close start t)
+                              (match-end 0)))
+                    (open (search-backward codec-spoken-open start t)))
+          (let ((overlay (make-overlay open end)))
+            (overlay-put overlay 'codec-spoken t)
+            (overlay-put overlay 'face 'codec-spoken-face)
+            (overlay-put overlay 'evaporate t)
+            (when codec-hide-spoken
+              (overlay-put overlay 'invisible t))
+            overlay))))))
+
+;;;; Speech
+
+(defcustom codec-tts-backend 'say
+  "The program that speaks the summaries.
+say is the macOS say command; see `codec-say-program'.  piper is
+Piper, which writes a WAV file that `codec-audio-player' plays; see
+`codec-piper-program'.  nil means speak nothing."
+  :type '(choice (const :tag "macOS say" say)
+                 (const :tag "Piper" piper)
+                 (const :tag "Do not speak" nil)))
+
+(defcustom codec-say-program "say"
+  "The say program, /usr/bin/say on macOS."
+  :type 'string)
+
+(defcustom codec-say-voice nil
+  "The voice for say, as for say -v, or nil for the system voice.
+Run say -v ? for the list."
+  :type '(choice (const :tag "System voice" nil) string))
+
+(defcustom codec-say-rate nil
+  "The speech rate for say in words per minute, or nil for the default."
+  :type '(choice (const :tag "Default" nil) natnum))
+
+(defcustom codec-piper-program "piper"
+  "The Piper program.  It reads text on stdin and writes a WAV file."
+  :type 'string)
+
+(defcustom codec-piper-model nil
+  "The Piper voice model, an .onnx file with its .onnx.json next to it."
+  :type '(choice (const :tag "Not set" nil) file))
+
+(defcustom codec-piper-extra-args nil
+  "More arguments for Piper, such as (\"--length_scale\" \"0.9\")."
+  :type '(repeat string))
+
+(defcustom codec-audio-player '("afplay")
+  "The program and arguments that play Piper's WAV file.
+The file name is appended.  For example (\"aplay\" \"-q\") on Linux."
+  :type '(repeat string))
+
+(defvar codec--tts-process nil "The process that speaks now, or nil.")
+(defvar codec--speech-muted nil
+  "Non-nil while codec mutes the listener because it speaks.")
+
+(defun codec--speaking-p ()
+  "Return non-nil if codec speaks now."
+  (and codec--tts-process t))
+
+(defun codec-speak (text)
+  "Speak TEXT with `codec-tts-backend', and stop any speech before it.
+The listener is muted until the speech ends."
+  (interactive "sSay: ")
+  (codec--kill-speech)
+  (let ((text (string-trim text)))
+    (if (or (string-empty-p text) (null codec-tts-backend))
+        (codec--speech-ended)
+      (codec--run-tts
+       (lambda ()
+         (pcase codec-tts-backend
+           ('say (codec--say text))
+           ('piper (codec--piper text))
+           (backend (error "Unknown `codec-tts-backend': %s" backend))))))))
+
+(defun codec-stop-speaking ()
+  "Stop the speech at once, and unmute the listener.
+The listener stays muted if you muted it with `codec-mute'."
+  (interactive)
+  (let ((speaking (codec--speaking-p)))
+    (codec--kill-speech)
+    (codec--speech-ended)
+    (when (called-interactively-p 'interactive)
+      (message (if speaking "codec: stopped speaking" "codec: not speaking")))))
+
+(defun codec-pedal ()
+  "Stop the speech if codec speaks, else toggle `codec-mode'.
+Bind this to a foot pedal: one press interrupts the agent's summary
+and lets you speak at once."
+  (interactive)
+  (if (codec--speaking-p)
+      (codec-stop-speaking)
+    (codec-mode 'toggle)))
+
+(defun codec--run-tts (start)
+  "Make the speech process with START, a function, and make it current.
+Mute the listener for it.  On error, log it and end the speech."
+  (condition-case err
+      (progn
+        (setq codec--tts-process (funcall start))
+        (codec--speech-started))
+    (error
+     (setq codec--tts-process nil)
+     (codec--log "cannot speak: %s" (error-message-string err))
+     (message "codec: cannot speak: %s" (error-message-string err))
+     (codec--speech-ended))))
+
+(defun codec--speech-started ()
+  "Mute the listener because codec speaks."
+  (unless codec--speech-muted
+    (setq codec--speech-muted t)
+    (when (and codec-mode (not codec--muted))
+      (codec--send "mute")))
+  (force-mode-line-update t))
+
+(defun codec--speech-ended ()
+  "Unmute the listener after speech, unless the user muted it."
+  (when codec--speech-muted
+    (setq codec--speech-muted nil)
+    (when (and codec-mode (not codec--muted))
+      (codec--send "unmute")))
+  (force-mode-line-update t))
+
+(defun codec--kill-speech ()
+  "Kill the speech process, if any, but leave the listener muted."
+  (let ((process codec--tts-process))
+    (setq codec--tts-process nil)
+    (when process
+      (delete-process process)
+      (codec--delete-file (process-get process 'codec-wav)))))
+
+(defun codec--reset-speech ()
+  "Kill the speech process and forget the speech mute, without unmuting."
+  (codec--kill-speech)
+  (setq codec--speech-muted nil))
+
+(defun codec--delete-file (file)
+  "Delete FILE if it is non-nil and exists."
+  (when (and file (file-exists-p file))
+    (ignore-errors (delete-file file))))
+
+(defun codec--tts-make-process (command)
+  "Start the speech COMMAND and return its process.
+Its output goes to `codec-log-buffer'."
+  (let ((default-directory temporary-file-directory))
+    (codec--log "speaking: %s" (mapconcat #'shell-quote-argument command " "))
+    (make-process :name "codec-tts"
+                  :command command
+                  :buffer (get-buffer-create codec-log-buffer)
+                  :connection-type 'pipe
+                  :coding 'utf-8
+                  :noquery t
+                  :sentinel #'codec--tts-sentinel)))
+
+(defun codec--say (text)
+  "Start say for TEXT and return its process."
+  (codec--tts-make-process
+   (append (list codec-say-program)
+           (and codec-say-voice (list "-v" codec-say-voice))
+           (and codec-say-rate (list "-r" (number-to-string codec-say-rate)))
+           (list text))))
+
+(defun codec--piper (text)
+  "Start Piper for TEXT and return its process.
+When Piper is done, the sentinel plays its WAV file."
+  (unless codec-piper-model
+    (error "Set `codec-piper-model' to a Piper voice"))
+  (let* ((wav (make-temp-file "codec-" nil ".wav"))
+         (process (condition-case err
+                      (codec--tts-make-process
+                       (append (list codec-piper-program
+                                     "--model" (expand-file-name codec-piper-model)
+                                     "--output_file" wav)
+                               codec-piper-extra-args))
+                    (error (codec--delete-file wav)
+                           (signal (car err) (cdr err))))))
+    (process-put process 'codec-wav wav)
+    (process-put process 'codec-then-play t)
+    (process-send-string process (concat text "\n"))
+    (process-send-eof process)
+    process))
+
+(defun codec--play (wav)
+  "Start `codec-audio-player' for the file WAV and return its process."
+  (let ((process (codec--tts-make-process
+                  (append codec-audio-player (list wav)))))
+    (process-put process 'codec-wav wav)
+    process))
+
+(defun codec--tts-sentinel (process _event)
+  "Go on when the speech PROCESS exits.
+After Piper, play its file; after the last step, unmute the listener."
+  (unless (process-live-p process)
+    (let ((current (eq process codec--tts-process))
+          (ok (and (eq (process-status process) 'exit)
+                   (zerop (process-exit-status process))))
+          (wav (process-get process 'codec-wav)))
+      (when (and current (not ok))
+        (codec--log "%s failed: %s" (car (process-command process))
+                    (process-exit-status process)))
+      (if (and current ok (process-get process 'codec-then-play))
+          (codec--run-tts
+           (lambda ()
+             (condition-case err
+                 (codec--play wav)
+               (error (codec--delete-file wav)
+                      (signal (car err) (cdr err))))))
+        (codec--delete-file wav)
+        (when current
+          (setq codec--tts-process nil)
+          (codec--speech-ended))))))
 
 ;;;; Listener process
 
@@ -550,9 +925,10 @@ They go as one voice prompt."
     (process-send-string codec--process (concat command "\n"))))
 
 (defun codec--set-muted (flag)
-  "Mute the listener if FLAG is non-nil, else unmute it."
+  "Mute the listener if FLAG is non-nil, else unmute it.
+The listener stays muted while codec speaks."
   (setq codec--muted flag)
-  (codec--send (if flag "mute" "unmute"))
+  (codec--send (if (or flag codec--speech-muted) "mute" "unmute"))
   (force-mode-line-update t))
 
 (defun codec--filter (process output)

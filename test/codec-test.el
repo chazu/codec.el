@@ -150,6 +150,20 @@
   (let ((codec-voice-preamble ""))
     (should (equal (codec-wrap-transcript "hello") "hello"))))
 
+(ert-deftest codec-test-preamble-follows-spoken-position ()
+  (let ((codec-voice-preamble nil)
+        (codec-preamble-position 'prepend))
+    (let ((codec-spoken-position 'top))
+      (should (string-match-p "Begin your reply with <spoken>"
+                              (codec-wrap-transcript "x"))))
+    (let ((codec-spoken-position 'bottom))
+      (should (string-match-p "end your reply with <spoken>"
+                              (codec-wrap-transcript "x"))))
+    ;; A string of the user's own wins over both.
+    (let ((codec-spoken-position 'bottom)
+          (codec-voice-preamble "[voice] mine"))
+      (should (equal (codec-wrap-transcript "x") "[voice] mine\n\nx")))))
+
 (ert-deftest codec-test-default-preamble-names-the-tags ()
   (let ((text (codec-wrap-transcript "x")))
     (should (string-prefix-p "[voice] " text))
@@ -440,6 +454,14 @@ STOP-REASON defaults to \"end_turn\"."
         (codec-spoken-close "]]"))
     (should (equal (codec-extract-spoken "x [[hi]] y") "hi"))))
 
+(ert-deftest codec-test-extract-first-spoken-block ()
+  (should (equal (codec-extract-spoken
+                  "a <spoken>one</spoken> b <spoken>two</spoken> c" t)
+                 "one"))
+  (should-not (codec-extract-spoken "<spoken>unclosed so far" t))
+  (should-not (codec-extract-spoken "no block here" t))
+  (should-not (codec-extract-spoken "</spoken> backwards <spoken>" t)))
+
 (ert-deftest codec-test-speakable-strips-markdown ()
   (let ((codec-spoken-max-chars 400))
     (should (equal (codec--speakable
@@ -699,6 +721,134 @@ STOP-REASON defaults to \"end_turn\"."
       (let ((overlays (codec-test--spoken-overlays shell)))
         (should (= (length overlays) 1))
         (should (overlay-get (car overlays) 'invisible))))))
+
+;;;; Summary at the top
+
+(ert-deftest codec-test-top-summary-is-spoken-early ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (codec--handle-utterance "What happened?")
+      (setq codec-test--busy t)
+      ;; Both tags are split across chunks.
+      (dolist (chunk '("<spo" "ken>Tests **pass**." nil "</spo"))
+        (codec-test--fire shell 'agent-message-chunk `((:text-chunk . ,chunk)))
+        (should-not (codec--speaking-p)))
+      (codec-test--fire shell 'agent-message-chunk '((:text-chunk . "ken>\nMore")))
+      ;; Spoken at once, while the agent still writes.
+      (should (codec--speaking-p))
+      (should (equal (codec-test--speech) "Tests pass."))
+      (should codec--voice-turn)
+      (should (codec-test--wait-for (lambda () (not (codec--speaking-p)))))
+      (should (equal (codec-test--tts-runs) '(("Tests pass.")))))))
+
+(ert-deftest codec-test-top-summary-is-spoken-once ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (setenv "CODEC_FAKE_TTS_SLEEP" "10")
+      (codec--handle-utterance "What happened?")
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>First.</spoken> Body. ")))
+      (let ((process codec--tts-process))
+        (should (equal (codec-test--speech) "First."))
+        ;; A later block in the same turn and the end of the turn neither
+        ;; kill nor restart the speech.
+        (codec-test--fire-reply shell '("<spoken>Second.</spoken> end"))
+        (should (codec-test--wait-for (lambda () (null codec--voice-turn))))
+        (accept-process-output nil 0.1)
+        (should (eq codec--tts-process process))
+        (should (process-live-p process))
+        (should (equal (codec-test--speech) "First."))))))
+
+(ert-deftest codec-test-top-without-summary-falls-back ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (codec--handle-utterance "What happened?")
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "No summary here.")))
+      (should-not (codec--speaking-p))
+      (codec-test--fire shell 'turn-complete '((:stop-reason . "end_turn")))
+      (should (codec-test--wait-for (lambda () (null codec--voice-turn))))
+      (should (equal (codec-test--speech) "Reply ready."))
+      (codec-stop-speaking)
+      ;; A first block with nothing speakable counts as none, and a later
+      ;; block does not stand in for it.
+      (codec--handle-utterance "Again?")
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>```x```</spoken> b ")))
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>Later.</spoken>")))
+      (should-not (codec--speaking-p))
+      (codec-test--fire shell 'turn-complete '((:stop-reason . "end_turn")))
+      (should (codec-test--wait-for (lambda () (null codec--voice-turn))))
+      (should (equal (codec-test--speech) "Reply ready.")))))
+
+(ert-deftest codec-test-bottom-summary-waits-for-turn-end ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*"))
+          (codec-spoken-position 'bottom))
+      (codec-test--start shell)
+      (codec--handle-utterance "What happened?")
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>Early.</spoken> body ")))
+      (should-not (codec--speaking-p))
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>Late.</spoken>")))
+      (should-not (codec--speaking-p))
+      (codec-test--fire shell 'turn-complete '((:stop-reason . "end_turn")))
+      (should (codec-test--wait-for (lambda () (null codec--voice-turn))))
+      (should (equal (codec-test--speech) "Late.")))))
+
+(ert-deftest codec-test-top-block-gets-overlay ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*"))
+          (reply "<spoken>Done.</spoken>\nDetails.  <spoken>Not this.</spoken>\n"))
+      (codec-test--start shell)
+      (with-current-buffer shell
+        (insert "Prompt: begin with <spoken>a summary</spoken>.\n"))
+      (codec--handle-utterance "hi")
+      (codec-test--fire shell 'agent-message-chunk `((:text-chunk . ,reply)))
+      (with-current-buffer shell (insert reply))
+      (codec-test--fire shell 'turn-complete '((:stop-reason . "end_turn")))
+      (should (codec-test--wait-for (lambda () (null codec--voice-turn))))
+      (let ((overlays (codec-test--spoken-overlays shell)))
+        (should (= (length overlays) 1))
+        (with-current-buffer shell
+          (should (equal (buffer-substring (overlay-start (car overlays))
+                                           (overlay-end (car overlays)))
+                         "<spoken>Done.</spoken>")))
+        (should (eq (overlay-get (car overlays) 'face) 'codec-spoken-face))))))
+
+(ert-deftest codec-test-unmute-while-agent-busy-queues ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (codec--handle-utterance "What happened?")
+      (setq codec-test--busy t
+            codec-test--sent nil
+            codec-test--commands nil)
+      (codec-test--fire shell 'agent-message-chunk
+                        '((:text-chunk . "<spoken>Done.</spoken> More")))
+      (should (equal codec-test--commands '("mute")))
+      ;; The speech ends before the turn: the listener is on again.
+      (should (codec-test--wait-for (lambda () (not (codec--speaking-p)))))
+      (should (equal codec-test--commands '("unmute" "mute")))
+      (should (eq (codec-state) 'listening))
+      ;; An utterance now waits for the turn to end.
+      (codec--handle-utterance "Next step.")
+      (should (equal codec--queue '("Next step.")))
+      (should-not codec-test--sent)
+      (setq codec-test--busy nil)
+      (codec-test--fire shell 'turn-complete '((:stop-reason . "end_turn")))
+      (should (codec-test--wait-for (lambda () codec-test--sent)))
+      (should (equal (codec-test--sent-texts)
+                     (list (codec-wrap-transcript "Next step."))))
+      (should-not codec--queue)
+      ;; The end of the turn spoke nothing more.
+      (should-not (codec--speaking-p))
+      (should (equal (codec-test--tts-runs) '(("Done.")))))))
 
 (ert-deftest codec-test-piper-backend ()
   (codec-test--with-env

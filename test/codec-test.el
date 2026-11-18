@@ -154,11 +154,24 @@
   (let ((codec-voice-preamble nil)
         (codec-preamble-position 'prepend))
     (let ((codec-spoken-position 'top))
-      (should (string-match-p "Begin your reply with <spoken>"
+      (should (string-match-p "Start with <spoken>"
                               (codec-wrap-transcript "x"))))
     (let ((codec-spoken-position 'bottom))
-      (should (string-match-p "end your reply with <spoken>"
+      (should (string-match-p "then end with <spoken>"
                               (codec-wrap-transcript "x"))))
+    ;; The built-in texts are short, since every voice prompt has one.
+    (let ((codec-spoken-position 'top))
+      (should (equal (codec-wrap-transcript "x")
+                     (concat "[voice] Start with <spoken>one or two plain "
+                             "sentences: result, then next step</spoken>, "
+                             "then answer in full. No code or markdown in "
+                             "<spoken>. Transcript may have errors.\n\nx"))))
+    (let ((codec-spoken-position 'bottom))
+      (should (equal (codec-wrap-transcript "x")
+                     (concat "[voice] Answer in full, then end with <spoken>"
+                             "one or two plain sentences: result, then next "
+                             "step</spoken>. No code or markdown in <spoken>. "
+                             "Transcript may have errors.\n\nx"))))
     ;; A string of the user's own wins over both.
     (let ((codec-spoken-position 'bottom)
           (codec-voice-preamble "[voice] mine"))

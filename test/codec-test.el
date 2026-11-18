@@ -371,13 +371,61 @@
 
 (ert-deftest codec-test-listener-arguments ()
   (let ((codec-model "base.en")
+        (codec-device 'auto)
+        (codec-compute-type 'auto)
         (codec-silence-ms 700)
         (codec-drop-phrases '("okay" "bye"))
-        (codec-listener-extra-args '("--device" "mps")))
+        (codec-listener-extra-args '("--beam-size" "1")))
     (should (equal (codec--listener-arguments)
-                   '("--model" "base.en" "--silence-ms" "700"
+                   '("--model" "base.en" "--device" "auto"
+                     "--compute-type" "auto" "--silence-ms" "700"
                      "--drop-phrase" "okay" "--drop-phrase" "bye"
-                     "--device" "mps")))))
+                     "--beam-size" "1")))))
+
+(ert-deftest codec-test-listener-arguments-device ()
+  (let ((codec-drop-phrases nil)
+        (codec-listener-extra-args nil))
+    (dolist (case '((cpu auto "cpu" "auto")
+                    (mps "float16" "mps" "float16")
+                    ("cuda" "int8_float16" "cuda" "int8_float16")))
+      (let ((codec-device (nth 0 case))
+            (codec-compute-type (nth 1 case)))
+        (let ((args (codec--listener-arguments)))
+          (should (equal (cadr (member "--device" args)) (nth 2 case)))
+          (should (equal (cadr (member "--compute-type" args))
+                         (nth 3 case))))))))
+
+(ert-deftest codec-test-device-defaults ()
+  (should (eq (default-value 'codec-device) 'auto))
+  (should (eq (default-value 'codec-compute-type) 'auto)))
+
+(ert-deftest codec-test-ready-names-the-device ()
+  (codec-test--with-env
+    (let ((shell (codec-test--shell "*agent-shell a*")))
+      (codec-test--start shell)
+      (should (equal codec--device "mps, int8_float16"))
+      (should (member "codec: ready on mps, int8_float16" codec-test--messages))
+      (should (string-match-p "listening on mps, int8_float16"
+                              (plist-get (text-properties-at
+                                          0 (codec--mode-line))
+                                         'help-echo)))
+      (with-current-buffer codec-log-buffer
+        (should (string-match-p "ready on mps, int8_float16"
+                                (buffer-string))))
+      (codec-mode -1)
+      (should-not codec--device))))
+
+(ert-deftest codec-test-ready-without-device ()
+  (codec-test--with-env
+    (let ((codec--ready nil)
+          (codec--muted-for-target nil)
+          (codec--device 'stale))
+      (codec--handle-line "{\"type\":\"ready\"}")
+      (should codec--ready)
+      (should-not codec--device)
+      (should (member "codec: ready" codec-test--messages))
+      (codec--handle-line "{\"type\":\"ready\",\"device\":\"cpu\",\"x\":[1]}")
+      (should (equal codec--device "cpu")))))
 
 (ert-deftest codec-test-default-command-uses-uv ()
   (let ((codec-listener-command nil)

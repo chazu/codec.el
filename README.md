@@ -228,23 +228,18 @@ The listener's stderr and codec's own log go to `*codec-listener-log*`.
 Only voice prompts get the preamble. Typed prompts stay as they are.
 When `codec-voice-preamble` is `nil` (the default), codec uses the
 built-in text for `codec-spoken-position`, from
-`codec-voice-preambles`. For `top`:
+`codec-voice-preambles`. It goes with every voice prompt, so it is
+kept short. For `top`:
 
-> [voice] The user is speaking to you hands-free and will hear only a
-> short spoken summary. Begin your reply with `<spoken>`one or two
-> plain, speakable sentences: the result and the one thing the user
-> should do next`</spoken>`. Then answer normally in full. No code,
-> paths or markdown inside `<spoken>`. The transcript below may have
-> speech-recognition errors.
+> [voice] Start with `<spoken>`one or two plain sentences: result, then
+> next step`</spoken>`, then answer in full. No code or markdown in
+> `<spoken>`. Transcript may have errors.
 
 For `bottom`:
 
-> [voice] The user is speaking to you hands-free and will hear only a
-> short spoken summary. Answer normally in full. Then end your reply
-> with `<spoken>`one or two plain, speakable sentences: the result and
-> the one thing the user should do next`</spoken>`. No code, paths or
-> markdown inside `<spoken>`. The transcript below may have
-> speech-recognition errors.
+> [voice] Answer in full, then end with `<spoken>`one or two plain
+> sentences: result, then next step`</spoken>`. No code or markdown in
+> `<spoken>`. Transcript may have errors.
 
 Set `codec-voice-preamble` to a string to use your own text. Your text
 then does not change with `codec-spoken-position`, so make sure that it

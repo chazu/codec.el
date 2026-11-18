@@ -154,21 +154,15 @@ it last, and codec speaks it when the turn completes."
 
 (defconst codec-voice-preambles
   `((top
-     . ,(concat "[voice] The user is speaking to you hands-free and will "
-                "hear only a short spoken summary.  Begin your reply with "
-                "%oone or two plain, speakable sentences: the result and "
-                "the one thing the user should do next%c.  Then answer "
-                "normally in full.  No code, paths or markdown inside %o.  "
-                "The transcript below may have speech-recognition errors."))
+     . ,(concat "[voice] Start with %oone or two plain sentences: result, "
+                "then next step%c, then answer in full. No code or "
+                "markdown in %o. Transcript may have errors."))
     (bottom
-     . ,(concat "[voice] The user is speaking to you hands-free and will "
-                "hear only a short spoken summary.  Answer normally in "
-                "full.  Then end your reply with %oone or two plain, "
-                "speakable sentences: the result and the one thing the "
-                "user should do next%c.  No code, paths or markdown inside "
-                "%o.  The transcript below may have speech-recognition "
-                "errors.")))
-  "The built-in voice preamble for each `codec-spoken-position'.")
+     . ,(concat "[voice] Answer in full, then end with %oone or two plain "
+                "sentences: result, then next step%c. No code or markdown "
+                "in %o. Transcript may have errors.")))
+  "The built-in voice preamble for each `codec-spoken-position'.
+It goes with every voice prompt, so it is kept short.")
 
 (defcustom codec-voice-preamble nil
   "Instructions added to each voice prompt, and to no typed prompt.

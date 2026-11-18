@@ -1,0 +1,17 @@
+# Byte-compiled and native-compiled Emacs Lisp
+*.elc
+*.eln
+*-autoloads.el
+
+# Python listener
+listener/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Model caches (should not end up here, but just in case)
+models/
+.cache/
+
+# agent-shell transcripts
+.agent-shell/
